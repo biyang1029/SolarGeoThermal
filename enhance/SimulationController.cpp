@@ -19,7 +19,8 @@
 
 // local helpers (avoid C++17-specific std::clamp/std::filesystem)
 static inline double clampd(double v, double lo, double hi){ return v<lo?lo:(v>hi?hi:v); }
-static std::string dirname_of(const std::string& p){ size_t pos=p.find_last_of("/\\"); return (pos==std::string::npos)?std::string():p.substr(0,pos); }
+static std::string dirname_of(const std::string& p){ size_t pos=p.find_last_of("/\\"); 
+return (pos==std::string::npos)?std::string():p.substr(0,pos); }
 
 // Progressbar
 static void printProgress(long long done_min, long long total_min, int barWidth = 40) {
@@ -104,56 +105,85 @@ static void add_minutes(int& y,int& m,int& d,int& hh,int& mm,int add_min){
 }
 static int day_of_year(int y,int m,int d){ int sum=0; for(int i=1;i<m;i++) sum+=days_in_month(i); return sum+d; }
 //Determine if in heating season, if no 
-static bool in_heating_season(const DataConfig& cfg, int y,int m,int d){
-    if(!cfg.season.enable) return true;
-    int ds = day_of_year(y,cfg.season.start_month,cfg.season.start_day);
-    int de = day_of_year(y,cfg.season.end_month,cfg.season.end_day);
-    int dc = day_of_year(y,m,d);
-    if (de>=ds) return dc>=ds && dc<=de; // same-year window
+static bool in_heating_season(const DataConfig& cfg, int y, int m, int d) {
+    if (!cfg.season.enable) return true;
+    int ds = day_of_year(y, cfg.season.start_month, cfg.season.start_day);
+    int de = day_of_year(y, cfg.season.end_month, cfg.season.end_day);
+    int dc = day_of_year(y, m, d);
+    if (de >= ds) return dc >= ds && dc <= de; // same-year window
     // wrap across year-end: Oct..Apr
-    return (dc>=ds) || (dc<=de);
+    return (dc >= ds) || (dc <= de);
+    // if in heating season run heat pump
+}
 
-    // if in heating season run simulation
-
-}bool SimulationController::run(const std::string& csv_path) {
+bool SimulationController::run(const std::string& csv_path) {
     // 
     ground_.initialize(cfg_);
     hp_.initialize(cfg_);
     tank_.initialize(cfg_);
+    solar_.initialize(cfg_);
+    solar_.loadWeather();
 
     bool summaryOnly = false; if (const char* v = std::getenv("SUMMARY_ONLY")) summaryOnly = (*v!='0' && *v!='n' && *v!='N') ;
     if (!summaryOnly && !logger_.open(csv_path)) {
         std::cerr << "[Error] Failed to open log file: " << csv_path << "\n";
         return false;
     }
-    // ???? debug ???
+    // open solar results file alongside results.csv
+    std::ofstream solar_ofs;
+    bool solar_log = false;
+    std::string solar_path;
+    if (!summaryOnly) {
+        auto baseName = [](const std::string& p)->std::string {
+            size_t pos = p.find_last_of("/\\");
+            return (pos == std::string::npos) ? p : p.substr(pos + 1);
+        };
+        auto replacePrefix = [](std::string s, const std::string& from, const std::string& to)->std::string {
+            if (s.rfind(from, 0) == 0) s.replace(0, from.size(), to);
+            return s;
+        };
+        std::string dir = dirname_of(csv_path);
+        std::string csvBase = baseName(csv_path);
+        std::string solarBase = replacePrefix(csvBase, "results", "results_solar");
+        if (solarBase == csvBase) solarBase = "results_solar_" + csvBase;
+        solar_path = dir.empty() ? solarBase : (dir + std::string("/") + solarBase);
+        solar_ofs.open(solar_path.c_str(), std::ios::out | std::ios::trunc);
+        if (solar_ofs) {
+            solar_log = true;
+            solar_ofs << "hour,date,time,solar_on,solar_mode,solar_irr_Wm2,solar_mdot_kgps,solar_T_in_C,solar_T_out_C,solar_Q_kW,solar_Q_raw_kW,"
+                      << "T_load_supply_C,T_load_return_C,T_ground_in_C,T_ground_out_C,flow_src_kgps,flow_load_kgps,v_src_ann_mps,v_src_in_mps,"
+                      << "HP_on,COP,Q_out_kW,P_el_kW,Q_geo_kW,P_pump_kW,Q_space_req_kW,Q_dhw_req_kW,Q_space_served_kW,Q_dhw_served_kW,Q_unmet_kW,T_tank_C,T_outdoor_C\n";
+        }
+    }
+    // open debug file
     logger_.openDebug("debug.csv");
 
-    // ??????
+    // 
     double T_return = cfg_.fluid.inlet_T_C;
+    double T_solar_return = cfg_.fluid.inlet_T_C; // used in non-heating season: ground outlet -> solar inlet
     tank_.reset(cfg_.tank.setpoint_C);
-    const int    maxIter = 300;
-    const double tolT    = 0.01; // 放宽收敛容差
+    const int    maxIter = 600;
+    const double tolT    = 0.01; 
 
     // Variable flow configuration (min/max kg/s), default around base mass flow
     static bool flow_cfg_inited = false;
-static double flow_src_min_kgps = 0.0, flow_src_max_kgps = 0.0;
-static double flow_load_min_kgps = 0.0, flow_load_max_kgps = 0.0;
+    static double flow_src_min_kgps = 0.0, flow_src_max_kgps = 0.0;
+    static double flow_load_min_kgps = 0.0, flow_load_max_kgps = 0.0;
 if (!flow_cfg_inited) {
     double base_src = cfg_.fluid.massFlow_kgps;
     double base_load = base_src;
-    if (const char* v = std::getenv("FLOW_SRC_KGPS")) { try { base_src = std::stod(v); } catch (...) {} }
-    if (const char* v = std::getenv("FLOW_LOAD_KGPS")) { try { base_load = std::stod(v); } catch (...) {} }
+    //if (const char* v = std::getenv("FLOW_SRC_KGPS")) { try { base_src = std::stod(v); } catch (...) {} }
+    //if (const char* v = std::getenv("FLOW_LOAD_KGPS")) { try { base_load = std::stod(v); } catch (...) {} }
     flow_src_min_kgps = std::max(0.1, 0.9 * base_src);
     flow_src_max_kgps = std::max(flow_src_min_kgps, 1.1 * base_src);
-    flow_load_min_kgps = std::max(0.1, 0.4 * base_load);
-    flow_load_max_kgps = std::max(flow_load_min_kgps, 1.2 * base_load);
-    if (const char* v = std::getenv("FLOW_SRC_MIN_KGPS")) { try { flow_src_min_kgps = std::stod(v); } catch (...) {} }
-    if (const char* v = std::getenv("FLOW_SRC_MAX_KGPS")) { try { flow_src_max_kgps = std::stod(v); } catch (...) {} }
-    if (const char* v = std::getenv("FLOW_LOAD_MIN_KGPS")) { try { flow_load_min_kgps = std::stod(v); } catch (...) {} }
-    if (const char* v = std::getenv("FLOW_LOAD_MAX_KGPS")) { try { flow_load_max_kgps = std::stod(v); } catch (...) {} }
-    if (const char* v = std::getenv("FLOW_MIN_KGPS")) { try { double t = std::stod(v); flow_src_min_kgps = t; } catch (...) {} }
-    if (const char* v = std::getenv("FLOW_MAX_KGPS")) { try { double t = std::stod(v); flow_src_max_kgps = t; } catch (...) {} }
+    flow_load_min_kgps = std::max(0.1, 1.0 * base_load);
+    flow_load_max_kgps = std::max(flow_load_min_kgps, 2.0 * base_load);
+    //if (const char* v = std::getenv("FLOW_SRC_MIN_KGPS")) { try { flow_src_min_kgps = std::stod(v); } catch (...) {} }
+    //if (const char* v = std::getenv("FLOW_SRC_MAX_KGPS")) { try { flow_src_max_kgps = std::stod(v); } catch (...) {} }
+    //if (const char* v = std::getenv("FLOW_LOAD_MIN_KGPS")) { try { flow_load_min_kgps = std::stod(v); } catch (...) {} }
+    //if (const char* v = std::getenv("FLOW_LOAD_MAX_KGPS")) { try { flow_load_max_kgps = std::stod(v); } catch (...) {} }
+    //if (const char* v = std::getenv("FLOW_MIN_KGPS")) { try { double t = std::stod(v); flow_src_min_kgps = t; } catch (...) {} }
+    //if (const char* v = std::getenv("FLOW_MAX_KGPS")) { try { double t = std::stod(v); flow_src_max_kgps = t; } catch (...) {} }
     flow_cfg_inited = true;
 }
 
@@ -166,6 +196,8 @@ if (!flow_cfg_inited) {
     bool logHourly = false; if (const char* v = std::getenv("LOG_HOURLY")) logHourly = (*v!='0' && *v!='n' && *v!='N');
     int stepsPerHour = (int)std::max(1.0, std::round(3600.0/cfg_.time.timeStep_s));
 
+    // --- override enhanced segment depth by env var ---
+
         // Variable-step schedule and per-hour logging
     long long target_minutes = (long long)std::llround(cfg_.time.totalSteps * (std::max(1.0, cfg_.time.timeStep_s) / 60.0));
     long long elapsed_min = 0;
@@ -173,8 +205,9 @@ if (!flow_cfg_inited) {
     double last_dt_s = 600.0; // default 10 min
     while (elapsed_min < target_minutes) {
         // schedule: first 2000 steps = 10 min; then +6 s per step to 1h; then keep 2h
-        double dt_s = 0.0;
-        if (stepIdx < 12000) dt_s = 600.0; else if (last_dt_s < 3600.0) dt_s = std::min(3600.0, last_dt_s + 3.0); else dt_s = 3600.0;
+        double dt_s = 600.0;
+
+        if (stepIdx < 12000) dt_s = 600.0; else if (last_dt_s < 3600.0) dt_s = std::min(600.0, last_dt_s + 3.0); else dt_s = 600.0;
         last_dt_s = dt_s;
         int stepMin = (int)std::max(1.0, std::round(dt_s/60.0));
 
@@ -192,102 +225,166 @@ if (!flow_cfg_inited) {
         double T_outdoor_C = load_.toutAt(hourIndex, cfg_.load.indoor_T_C);
         double Q_dhw_req_kW = (cfg_.dhw.enable ? load_.dhwAt(hourIndex, cfg_.dhw) : 0.0);
 
+        // 负荷缩放：可按需调整
+        const double load_scale = CFG.load.loadscale;
+        Q_space_req_kW *= load_scale;
+        Q_dhw_req_kW   *= load_scale;
         double present_req_kW = std::max(0.0, Q_space_req_kW + Q_dhw_req_kW);
         bool any_demand = (present_req_kW > 1e-6);
 
         const double Ttank = tank_.temperature_C();
-        // 强制的供热开/关阈值：<=40 开机，>=50 关机，其余保持原状态
+
+        // Solar concentrator: heating season -> tank; non-heating season -> ground recharge loop.
+        int solar_mode = heating_on ? 1 : 2; // 1=tank, 2=ground
+        SolarModule::Result solar = solar_.step(hourIndex, heating_on ? Ttank : T_solar_return);
+        double Q_solar_to_tank_kW = (heating_on ? solar.Q_kW : 0.0);
+        // 水箱温控：<=45 开机，>=55 关机，其余保持原状态
         const double on_th  = 40.0;
-        const double off_th = 50.0;
+        const double off_th = 45.0;
         if (!hp_on_ && Ttank <= on_th && heating_on && any_demand) hp_on_ = true;
         if (hp_on_  && (Ttank >= off_th || !heating_on || !any_demand)) hp_on_ = false;
+        double present_req = std::max(0.0, Q_space_req_kW + Q_dhw_req_kW);
 
-        if (hp_on_) hp_.setDemand(present_req_kW); else hp_.setDemand(0.0);
+
+        double cmd = 0.0;
+
+        if (hp_on_) hp_.setDemand(cfg_.hp.max_Q_out_kW);
+        else        hp_.setDemand(0.0);
+
         double frac = 0.0;
         if (hp_on_) {
-            double qreq = std::max(0.0, Q_space_req_kW + Q_dhw_req_kW);
             double qmax = std::max(1e-6, cfg_.hp.max_Q_out_kW);
-            frac = clampd(qreq / qmax, 0.0, 1.0);
+            frac = clampd(cmd / qmax, 0.0, 1.0);
         }
-        // 变流量：按需求比例在最小-最大之间线性调节
-    double flow_src_now = 10.8; // 固定源侧流量
-        double flow_load_now = (heating_on && any_demand)
-            ? (flow_load_min_kgps + (flow_load_max_kgps - flow_load_min_kgps) * frac)
-            : 1e-6;
+        // 固定流量运行：供暖季按热泵；非供暖季太阳能运行时用于地热回灌循环
+        double flow_src_now = 0.0;
+        double flow_load_now = 0.0;
+        if (heating_on && any_demand && hp_on_) {
+            flow_src_now = cfg_.pump.mdot_ground_kgps;
+            flow_load_now = cfg_.pump.mdot_load_kgps;
+        } else if ((!heating_on) && solar.on) {
+            flow_src_now = solar.mdot_kgps;
+            flow_load_now = 0.0;
+        }
         ground_.setMassFlow(flow_src_now);
-        hp_.setMassFlow(flow_src_now);
+        hp_.setSourceMassFlow(flow_src_now);
 
         double COP = 0, Q_out_kW = 0, P_el_kW = 0, Q_geo_kW = 0;
         // 迭代主变量改为热泵进水温度（地源出水）
-        double T_source_in_iter = clampd(T_return, T_min_phys, T_max_phys);
-        double T_geo_in_now = T_return;   // 热泵出水 / 地源进水
+        double T_source_in_iter = clampd(heating_on ? T_return : T_solar_return, T_min_phys, T_max_phys);
+        double T_geo_in_now = heating_on ? T_return : solar.T_out_C;   // 热泵出水 / 地源进水
         double T_source_out = T_source_in_iter;
+        double T_return_next = T_return; // next HP-side source return temp (kept in heating season)
+        double T_return_log = T_return;  // what gets written to results.csv for this step
 
         static bool warned_src_low = false;
 
-        for (int it = 0; it < maxIter - 1; ++it) {
-            // 动态松弛：前期偏大加速收敛，后期偏小防震荡
-            double relax_eff = 0.2;
-            if (it > 30)      relax_eff = 0.08;
-            else if (it > 15) relax_eff = 0.10;
-            else if (it > 5)  relax_eff = 0.15;
+        if (heating_on && any_demand && hp_on_) {
+            for (int it = 0; it < maxIter - 1; ++it) {
+                // 动态松弛：前期偏大加速收敛，后期偏小防震荡
+                double relax_eff = 0.2;
+                if (it > 30)      relax_eff = 0.08;
+                else if (it > 15) relax_eff = 0.10;
+                else if (it > 5)  relax_eff = 0.15;
 
-            // 1) 热泵步：基于当前地源出水温度，得到热泵出水与 Q_geo
-            T_geo_in_now = hp_.step(T_source_in_iter, dt_s, COP, Q_out_kW, P_el_kW);
-            if (!std::isfinite(T_geo_in_now)) T_geo_in_now = T_source_in_iter;
-            T_geo_in_now = clampd(T_geo_in_now, T_min_phys, T_max_phys);
+                // 1) 热泵步：基于当前地源出水温度，得到热泵出水与 Q_geo
+                T_geo_in_now = hp_.step(T_source_in_iter, tank_.temperature_C(), flow_load_now, dt_s, COP, Q_out_kW, P_el_kW);
+                if (!std::isfinite(T_geo_in_now)) T_geo_in_now = T_source_in_iter;
+                T_geo_in_now = clampd(T_geo_in_now, T_min_phys, T_max_phys);
+                Q_geo_kW = Q_out_kW - P_el_kW;
+                // 保护：源侧进水过低时提示一次
+                if (!warned_src_low && hp_on_ && T_source_in_iter <= cfg_.hp.min_source_return_C + 1e-6) {
+                    std::cerr << "[Warning] Source inlet temperature clamped at/near minimum (" << T_source_in_iter
+                              << " C <= limit " << cfg_.hp.min_source_return_C << " C)."
+                              << " Check: HP_MIN_SRC_RETURN_C/HP_FREEZE_GUARD_C, brine type (antifreeze), flow_src, bore length.\n";
+                    warned_src_low = true;
+                }
+
+                // 2) 地源步：基于热泵出水温度与当前 Q_geo，预测新的地源出水温度
+                double T_next_source_in = ground_.step(T_geo_in_now, Q_geo_kW, dt_s, /*advanceSoil=*/false);
+                if (!std::isfinite(T_next_source_in)) T_next_source_in = T_source_in_iter;
+                T_next_source_in = clampd(T_next_source_in, T_min_phys, T_max_phys);
+
+                // 限制迭代跳变并检查收敛
+                const double max_dT_iter = 5.0;
+                double dT = clampd(T_next_source_in - T_source_in_iter, -max_dT_iter, max_dT_iter);
+                T_next_source_in = T_source_in_iter + dT;
+                if (std::fabs(T_next_source_in - T_source_in_iter) < tolT) {
+                    T_source_in_iter = T_next_source_in;
+                    break;
+                }
+
+                // 松弛更新
+                T_source_in_iter = relax_eff * T_next_source_in + (1.0 - relax_eff) * T_source_in_iter;
+                T_source_in_iter = clampd(T_source_in_iter, T_min_phys, T_max_phys);
+            }
+
+            // 用收敛后的热泵出水温度推进土壤（advanceSoil=true）
+            T_source_out = ground_.step(T_geo_in_now, Q_geo_kW, dt_s, /*advanceSoil=*/true);
+            if (!std::isfinite(T_source_out)) T_source_out = T_source_in_iter;
+            T_source_out = clampd(T_source_out, T_min_phys, T_max_phys);
+            // 最终热泵步，得到下一步回水温度
+            T_return_next = hp_.step(T_source_out, tank_.temperature_C(), flow_load_now, dt_s, COP, Q_out_kW, P_el_kW);
+            // 确保用于日志/后处理的 Q_geo 与最终一步一致
             Q_geo_kW = Q_out_kW - P_el_kW;
-            // 保护：源侧进水过低时提示一次
-            if (!warned_src_low && hp_on_ && T_source_in_iter <= cfg_.hp.min_source_return_C + 1e-6) {
-                std::cerr << "[Warning] Source inlet temperature clamped at/near minimum (" << T_source_in_iter
-                          << " C <= limit " << cfg_.hp.min_source_return_C << " C)."
-                          << " Check: HP_MIN_SRC_RETURN_C/HP_FREEZE_GUARD_C, brine type (antifreeze), flow_src, bore length.\n";
-                warned_src_low = true;
+            if (!std::isfinite(T_return_next)) T_return_next = T_source_in_iter;
+            bool hit_min = (T_return_next <= T_min_phys + 1e-9);
+            if (hit_min) {
+                // 触发源侧冻结保护：这一小时视为 HP 输出为 0（或降到很小）
+                Q_out_kW = 0; P_el_kW = 0; COP = 0;
+                // 不写回 clamp 值，保持上一小时回水作为状态（避免自激）
+                T_return_next = T_return;
             }
-
-            // 2) 地源步：基于热泵出水温度与当前 Q_geo，预测新的地源出水温度
-            double T_next_source_in = ground_.step(T_geo_in_now, Q_geo_kW, dt_s, /*advanceSoil=*/false);
-            if (!std::isfinite(T_next_source_in)) T_next_source_in = T_source_in_iter;
-            T_next_source_in = clampd(T_next_source_in, T_min_phys, T_max_phys);
-
-            // 限制迭代跳变并检查收敛
-            const double max_dT_iter = 5.0;
-            double dT = clampd(T_next_source_in - T_source_in_iter, -max_dT_iter, max_dT_iter);
-            T_next_source_in = T_source_in_iter + dT;
-            if (std::fabs(T_next_source_in - T_source_in_iter) < tolT) {
-                T_source_in_iter = T_next_source_in;
-                break;
+            T_return_log = T_return_next;
+        } else {
+            // No heating-season HP operation: still advance soil; in non-heating season, solar can drive a simple recharge loop.
+            double Q_ground_kW = 0.0;
+            if (!heating_on) {
+                if (solar.on) {
+                    // Solar outlet -> ground inlet; ground outlet -> solar inlet (return) for next step.
+                    T_geo_in_now = clampd(solar.T_out_C, T_min_phys, T_max_phys);
+                    T_source_out = ground_.step(T_geo_in_now, Q_ground_kW, dt_s, /*advanceSoil=*/true);
+                    if (!std::isfinite(T_source_out)) T_source_out = T_solar_return;
+                    T_source_out = clampd(T_source_out, T_min_phys, T_max_phys);
+                    T_solar_return = T_source_out;
+                    // Convention: Q_geo_kW >0 means ground extraction; recharge is negative.
+                    Q_geo_kW = -Q_ground_kW;
+                    T_return_log = T_geo_in_now; // log ground inlet temperature in off-season
+                } else {
+                    // Pump off: evolve soil naturally.
+                    T_source_out = ground_.step(T_solar_return, Q_ground_kW, dt_s, /*advanceSoil=*/true);
+                    if (!std::isfinite(T_source_out)) T_source_out = T_solar_return;
+                    T_source_out = clampd(T_source_out, T_min_phys, T_max_phys);
+                    Q_geo_kW = -Q_ground_kW;
+                    T_return_log = T_solar_return;
+                }
+            } else {
+                // Heating season but HP off: evolve soil naturally.
+                T_geo_in_now = clampd(T_return, T_min_phys, T_max_phys);
+                T_source_out = ground_.step(T_geo_in_now, Q_ground_kW, dt_s, /*advanceSoil=*/true);
+                if (!std::isfinite(T_source_out)) T_source_out = T_source_in_iter;
+                T_source_out = clampd(T_source_out, T_min_phys, T_max_phys);
+                Q_geo_kW = 0.0;
+                T_return_log = T_return;
             }
-
-            // 松弛更新
-            T_source_in_iter = relax_eff * T_next_source_in + (1.0 - relax_eff) * T_source_in_iter;
-            T_source_in_iter = clampd(T_source_in_iter, T_min_phys, T_max_phys);
+            COP = 0.0; Q_out_kW = 0.0; P_el_kW = 0.0;
+            T_return_next = T_return; // keep HP-side state unchanged outside heating season
         }
 
-        // 用收敛后的热泵出水温度推进土壤（advanceSoil=true）
-        T_source_out = ground_.step(T_geo_in_now, Q_geo_kW, dt_s, /*advanceSoil=*/true);
-        if (!std::isfinite(T_source_out)) T_source_out = T_source_in_iter;
-        T_source_out = clampd(T_source_out, T_min_phys, T_max_phys);
-        // 最终热泵步，得到下一步回水温度
-        double T_return_next = hp_.step(T_source_out, dt_s, COP, Q_out_kW, P_el_kW);
-        // 确保用于日志/后处理的 Q_geo 与最终一步一致
-        Q_geo_kW = Q_out_kW - P_el_kW;
-        if (!std::isfinite(T_return_next)) T_return_next = T_source_in_iter;
-        T_return_next = clampd(T_return_next, T_min_phys, T_max_phys);
-
         double Q_space_served_kW = 0.0, Q_dhw_served_kW = 0.0, Q_unmet_kW = 0.0;
-        tank_.applyHour(dt_s, Q_out_kW, Q_space_req_kW, Q_dhw_req_kW,
+        tank_.applyHour(dt_s, Q_out_kW + Q_solar_to_tank_kW, Q_space_req_kW, Q_dhw_req_kW,
                         Q_space_served_kW, Q_dhw_served_kW, Q_unmet_kW);
 
         // 估算负荷侧供回水温度（基于水箱温度与负荷流量）
         double Q_served_kW = Q_space_served_kW + Q_dhw_served_kW;
-        double T_load_supply = tank_.temperature_C();
-        double T_load_return = T_load_supply;
-        double T_hp_load_out = T_load_supply;
+        // 负荷侧回水即水箱温度，供水按当前输出功率和流量计算升温，热泵出水=供水
+        double T_load_return = tank_.temperature_C();
+        double T_load_supply = T_load_return;
+        double T_hp_load_out = T_load_return;
         if (flow_load_now > 1e-9) {
-            double dT_load = (Q_served_kW * 1000.0) / (flow_load_now * cfg_.fluid.cp);
-            T_load_return = T_load_supply - dT_load;
-            T_hp_load_out = T_load_supply + dT_load; // 热泵送入水箱的估算出水温
+            double dT_load = (Q_out_kW * 1000.0) / (flow_load_now * cfg_.fluid.cp);
+            T_load_supply = T_load_return + dT_load;
+            T_hp_load_out = T_load_supply;
         }
 
         auto safe = [](double v, double lo){ return (v>lo? v: lo); };
@@ -305,6 +402,12 @@ if (!flow_cfg_inited) {
         const double m_dot = std::max(1e-9, flow_src_now);
         const double v_ann = m_dot / (rho * A_ann);
         const double v_in  = m_dot / (rho * A_in);
+        double v_src_ann_mps = 0.0;
+        double v_src_in_mps = 0.0;
+        if (flow_src_now > 1e-9 && rho > 1e-9) {
+            v_src_ann_mps = flow_src_now / (rho * A_ann);
+            v_src_in_mps = flow_src_now / (rho * A_in);
+        }
         const double Re_ann = rho * v_ann * Dh_ann / safe(mu,1e-9);
         const double Re_in  = rho * v_in  * std::max(1e-6, D_i_inner) / safe(mu,1e-9);
         auto fric = [&](double Re, double rel_rough)->double{
@@ -346,23 +449,42 @@ if (!flow_cfg_inited) {
                 add_minutes(yL,mL,dL,hL,minL, deltaMin);
                 char bufDate[16]; snprintf(bufDate,sizeof(bufDate),"%04d-%02d-%02d",yL,mL,dL);
                 char bufTime[8];  snprintf(bufTime,sizeof(bufTime), "%02d:%02d",hL,0);
-                logger_.writeHour(hh, T_source_out, T_return_next, COP, Q_out_kW, P_el_kW, Q_geo_kW,
+                logger_.writeHour(hh, T_source_out, T_return_log, COP, Q_out_kW, P_el_kW, Q_geo_kW,
                                   T_outdoor_C, T_load_supply, T_load_return, T_hp_load_out, model,
                                   std::string(bufDate), std::string(bufTime),
                                   tank_.temperature_C(), hp_on_?1:0,
                                   Q_space_req_kW, Q_dhw_req_kW,
                                   Q_space_served_kW, Q_dhw_served_kW, Q_unmet_kW,
-                                  flow_src_now, flow_load_now, dP_kPa, P_pump_kW);
+                                  flow_src_now, flow_load_now, dP_kPa, P_pump_kW,
+                                  solar.on?1:0, solar_mode, solar.irr_Wm2, solar.mdot_kgps,
+                                  solar.T_in_C, solar.T_out_C, solar.Q_kW, solar.Q_raw_kW);
                 logger_.writeDebugHour(hh, dbg.fluid, dbg.used_coolprop,
                                        dbg.T_evap_sat_K, dbg.T_cond_sat_K,
                                        dbg.P_evap_kPa, dbg.P_cond_kPa,
                                        dbg.h1, dbg.h2s, dbg.h2, dbg.h3,
                                        T_source_in_iter, T_geo_in_now, Q_geo_kW,
                                        flow_src_now, flow_load_now, T_outdoor_C);
+                if (solar_log) {
+                    solar_ofs << hh << ',' << bufDate << ',' << bufTime << ','
+                              << (solar.on?1:0) << ',' << solar_mode << ','
+                              << std::fixed << std::setprecision(4)
+                              << solar.irr_Wm2 << ',' << solar.mdot_kgps << ','
+                              << solar.T_in_C << ',' << solar.T_out_C << ','
+                              << solar.Q_kW << ',' << solar.Q_raw_kW << ','
+                              << T_load_supply << ',' << T_load_return << ','
+                              << T_return_log << ',' << T_source_out << ','
+                              << flow_src_now << ',' << flow_load_now << ','
+                              << v_src_ann_mps << ',' << v_src_in_mps << ','
+                              << (hp_on_?1:0) << ',' << COP << ','
+                              << Q_out_kW << ',' << P_el_kW << ',' << Q_geo_kW << ',' << P_pump_kW << ','
+                              << Q_space_req_kW << ',' << Q_dhw_req_kW << ','
+                              << Q_space_served_kW << ',' << Q_dhw_served_kW << ',' << Q_unmet_kW << ','
+                              << tank_.temperature_C() << ',' << T_outdoor_C << "\n";
+                }
             }
         }
 
-        T_return = T_return_next;
+        if (heating_on) T_return = T_return_next;
         long long done = std::min(target_minutes, elapsed_min + stepMin);
         printProgressThrottled(done, target_minutes);
         add_minutes(curY,curM,curD,curH,curMin, stepMin);
@@ -373,6 +495,7 @@ if (!flow_cfg_inited) {
     printProgress(target_minutes, target_minutes);
     std::cout << std::endl;
     logger_.close();
+    if (solar_ofs.is_open()) solar_ofs.close();
 
     // Economic summary (optional scaling to annual)
     // Re-parse this run's results.csv
@@ -386,24 +509,25 @@ if (!flow_cfg_inited) {
         double sumPel_kWh = 0.0, sumPump_kWh = 0.0, sumQspace_kWh = 0.0, sumQdhw_kWh = 0.0;
         double peakPel_kW = 0.0, peakPump_kW = 0.0, peakQout_kW = 0.0;
         int onSteps=0, starts=0, stops=0; int prevOn=0;
-        const double dt_h = cfg_.time.timeStep_s / 3600.0;
+        // results.csv is logged per-hour, so each row represents 1 hour.
+        const double dt_h = 1.0;
         while (std::getline(ifs, line)) {
             if (line.empty()) continue;
             // crude CSV parse
-            // columns: step, T_source_out_C, T_return_C, COP, Q_out_kW, P_el_kW, Q_geo_kW, model, T_tank_C, HP_on, Q_space_req_kW, Q_dhw_req_kW, Q_space_served_kW, Q_dhw_served_kW, Q_unmet_kW, flow_kgps, dP_kPa, P_pump_kW
-            // indexes: 0        1                2            3    4         5          6        7      8          9      10               11               12                   13                  14            15         16      17
+            // columns (fixed order): step,date,time,T_source_out_C,T_return_C,COP,Q_out_kW,P_el_kW,Q_geo_kW,...,P_pump_kW,(solar...)
+            // indexes used below: Q_out_kW=6, P_el_kW=7, Q_space_served_kW=18, Q_dhw_served_kW=19, HP_on=15, P_pump_kW=24
             std::vector<std::string> cells; cells.reserve(20);
             std::string cur; for (char c: line) { if (c==',') { cells.push_back(cur); cur.clear(); } else { cur.push_back(c); } } cells.push_back(cur);
             auto rd = [&](int idx){ if (idx >=0 && idx < (int)cells.size()) { try { return std::stod(cells[idx]); } catch(...) { return 0.0; } } return 0.0; };
-            double Pel = rd(5), Ppump = rd(17), Qspace = rd(12), Qdhw = rd(13);
+            double Pel = rd(7), Ppump = rd(24), Qspace = rd(18), Qdhw = rd(19);
             sumPel_kWh += Pel * dt_h;
             sumPump_kWh += Ppump * dt_h;
             sumQspace_kWh += Qspace * dt_h;
             sumQdhw_kWh += Qdhw * dt_h;
             peakPel_kW = std::max(peakPel_kW, Pel);
             peakPump_kW = std::max(peakPump_kW, Ppump);
-            peakQout_kW = std::max(peakQout_kW, rd(4));
-            int on = int(rd(9)); if (on==1){ onSteps++; }
+            peakQout_kW = std::max(peakQout_kW, rd(6));
+            int on = int(rd(15)); if (on==1){ onSteps++; }
             if (prevOn==0 && on==1) starts++; if (prevOn==1 && on==0) stops++; prevOn = on;
         }
         double elec_kWh = sumPel_kWh + sumPump_kWh;
@@ -444,7 +568,23 @@ if (!flow_cfg_inited) {
         }
         const double om_annual = cfg_.econ.om_factor * capex;
         double LCOH_annual = (heat_kWh_annual > 1e-9) ? ((capex * CRF) + om_annual + elec_kWh_annual * cfg_.econ.elec_price_per_kWh) / heat_kWh_annual : 0.0;
-        std::string sumPath = dir.empty()? std::string("summary.csv") : (dir + std::string("/summary.csv"));
+        //std::string sumPath = dir.empty()? std::string("summary.csv") : (dir + std::string("/summary.csv"));
+        // derive summary file name from csv_path: results_XXX.csv -> summary_XXX.csv
+        auto baseName = [](const std::string& p)->std::string {
+            size_t pos = p.find_last_of("/\\");
+            return (pos == std::string::npos) ? p : p.substr(pos + 1);
+            };
+        auto replacePrefix = [](std::string s, const std::string& from, const std::string& to)->std::string {
+            if (s.rfind(from, 0) == 0) s.replace(0, from.size(), to);
+            return s;
+            };
+        std::string csvBase = baseName(csv_path);
+        std::string sumBase = replacePrefix(csvBase, "results", "summary");
+        if (sumBase == csvBase) sumBase = "summary_" + csvBase; // fallback
+
+        std::string sumPath = dir.empty() ? sumBase : (dir + std::string("/") + sumBase);
+
+
         std::ofstream ofs(sumPath.c_str(), std::ios::out | std::ios::trunc);
         if (ofs) {
             ofs << "elec_kWh,comp_kWh,pump_kWh,heat_kWh,space_kWh,dhw_kWh,cost_elec,capex,lifetime_y,discount,CRF,LCOH_annual,SCOP_sys,peak_Pel_kW,peak_Ppump_kW,peak_Qout_kW,on_hours,starts,stops,om_annual\n";

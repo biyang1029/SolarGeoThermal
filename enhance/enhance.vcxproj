@@ -24,6 +24,7 @@
     <ProjectGuid>{0645545c-c2ad-42e8-ad87-a24ba706bab3}</ProjectGuid>
     <RootNamespace>enhance</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <ProjectName>solargeo</ProjectName>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
@@ -156,6 +157,7 @@
     <ClInclude Include="Utils.h" />
     <ClInclude Include="LoadModel.h" />
     <ClInclude Include="TankModule.h" />
+    <ClInclude Include="SolarModule.h" />
     <ClInclude Include="Optimizer.h" />
   </ItemGroup>
   <ItemGroup>
@@ -163,14 +165,12 @@
     <ClCompile Include="SimulationController.cpp" />
     <ClCompile Include="GroundModule.cpp" />
     <ClCompile Include="HeatPumpModule.cpp" />
+    <ClCompile Include="SolarModule.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="Utils.cpp" />
     <ClCompile Include="Logger.cpp" />
-
     <ClCompile Include="LoadModel.cpp" />
     <ClCompile Include="Optimizer.cpp" />
-
-
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

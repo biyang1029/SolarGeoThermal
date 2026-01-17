@@ -47,23 +47,24 @@ public:
         double E_available = std::max(0.0, E_above_min_init + E_hp - E_loss);
 
         // DHW priority (typical). Serve DHW first, then space heat.
+
         double E_dhw_served = std::min(E_dhw_req, E_available);
         E_available -= E_dhw_served;
         double E_space_served = std::min(E_space_req, E_available);
         E_available -= E_space_served;
 
-        // Unmet over the step (average kW)
+        Q_dhw_served_kW = E_dhw_served / dt_s / 1000.0;
+        Q_space_served_kW = E_space_served / dt_s / 1000.0;
+
         const double E_unmet = (E_space_req + E_dhw_req) - (E_space_served + E_dhw_served);
         Q_unmet_kW = (E_unmet > 0.0) ? (E_unmet / dt_s / 1000.0) : 0.0;
-        Q_space_served_kW = E_space_served / dt_s / 1000.0;
-        Q_dhw_served_kW   = E_dhw_served   / dt_s / 1000.0;
 
-        // Remaining energy above Tmin stored in tank, clip to Tmax
-        double E_above_min_final = E_available; // after serving loads
-        double T_new = Tmin + E_above_min_final / (m * cp);
+        // Remaining energy above Tmin is E_available
+        double T_new = Tmin + E_available / (m * cp);
         if (T_new > Tmax) T_new = Tmax;
         if (T_new < Tmin) T_new = Tmin;
         T_C_ = T_new;
+
     }
 
 private:

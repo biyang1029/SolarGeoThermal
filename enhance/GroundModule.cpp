@@ -8,7 +8,7 @@
 static inline double clampd(double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 void GroundModule::setMassFlow(double m_dot_kgps) {
-    cfg_.fluid.massFlow_kgps = m_dot_kgps;
+    m_dot_kgps_ = m_dot_kgps;
 }
 
 void GroundModule::initialize(const DataConfig& cfg) {
@@ -44,8 +44,22 @@ double GroundModule::step(double T_return_C, double& Q_extracted_kW, double dt_s
     for (int i = 0; i < N_; ++i) {
         T_soil_local[i] = (Nr_ > 0) ? Tsoil_[0][i] : (cfg_.T_surface_C + cfg_.geograd_C_per_m * zc_[i]);
     }
+    // ---- ADD: pump-off short-circuit ----
+    if (m_dot_kgps_ <= 0.0) {
+        Q_extracted_kW = 0.0;
 
-    const double m_dot = std::max(1e-9, cfg_.fluid.massFlow_kgps);
+        // 可选：如果你希望“热泵停机时土壤也按自然边界继续演化”，保留这一句
+        if (advanceSoil) soil_step_ADI_(dt_s);
+
+        // 不改变管内温度（保持上一步状态）
+        return T_inner_.empty() ? T_return_C : T_inner_.front();
+    }
+    // ---- END ADD ----
+
+    // ---- REPLACE: keep numeric safety but not fake-flow ----
+    const double m_dot = m_dot_kgps_;   // 这里不再 max(1e-9,...)
+    // 如果你仍担心除零，在后面用 std::max(1e-12, m_dot) 只做分母保护即可
+
     const double cp    = cfg_.fluid.cp;
     const double rho   = cfg_.fluid.rho;
     const double mu    = std::max(1e-9, cfg_.fluid.mu);
@@ -74,6 +88,7 @@ double GroundModule::step(double T_return_C, double& Q_extracted_kW, double dt_s
     };
     const double Pr = cfg_.calcPr();
     const double h_min = 5.0;
+    const double h_boost = 1.0; // 适度增强对流换热系数
 
     std::vector<double> T_outer_new(N_, 0.0), T_inner_new(N_, 0.0), q_line(N_, 0.0);
     const int maxIter = 6;
@@ -85,37 +100,108 @@ double GroundModule::step(double T_return_C, double& Q_extracted_kW, double dt_s
         double Re_outer = cfg_.calcRe(m_dot, Dh_outer);
         for (int i = 0; i < N_; ++i) {
             double Nu = cfg_.NuFunc ? cfg_.NuFunc(Re_outer, Pr, zc_[i]) : blendNu(Re_outer, Pr);
-            double h_o  = std::max(h_min, Nu * kf / std::max(1e-6, Dh_outer));
-            // 全部热阻到土壤：Rf+Rp+Rg
-            double Rf = 1.0 / std::max(1e-9, h_o * P_outer);
+            double h_o  = h_boost * std::max(h_min, Nu * kf / std::max(1e-6, Dh_outer));
+      
+            // 仅计算管壁和灌浆的导热热阻 R_cond (即原 Rp + Rg)
             double k_outer = (cfg_.pipe_k_outer > 0.0 ? cfg_.pipe_k_outer : cfg_.pipe.k);
-            double Rp = std::log(r_po / r_pi) / (2.0 * PI * std::max(1e-9, k_outer));
-            double Rg = std::log(r_bo / r_po) / (2.0 * PI * std::max(1e-9, cfg_.grout.k));
-            double Rb = Rf + Rp + Rg;
-            double T_wall = T_soil_local[i];
-            double q_wall = (T_prev - T_wall) / std::max(1e-12, Rb); // W/m
+            double Rp = std::log(r_po / r_pi) / (2.0 * PI * std::max(1e-9, k_outer)); // 外管壁导热热阻
+            double Rg = std::log(r_bo / r_po) / (2.0 * PI * std::max(1e-9, cfg_.grout.k)); // 灌浆导热热阻
+            double R_cond = Rp + Rg; // R_cond：从外管内壁到近壁土壤的总导热热阻
 
+            double T_wall_soil = T_soil_local[i]; // 近壁土壤温度 T_soil
+
+            // (1) 定义 q_wall_conv: 外管流体与外管内壁的对流换热热流
+            // (2) 定义 q_wall_cond: 外管内壁通过导热传给土壤的热流
+            // 在稳定状态下，q_wall_conv = q_wall_cond = q_wall_total
+
+            // T_wall_inner 是未知的“外管内壁温度”
+            // q_wall_conv = h_o * P_outer * (T_prev - T_wall_inner)
+            // q_wall_cond = (T_wall_inner - T_wall_soil) / R_cond
+            // 联立解 T_wall_inner:
+            // T_wall_inner * (h_o * P_outer + 1.0 / R_cond) = h_o * P_outer * T_prev + T_wall_soil / R_cond
+
+            double hA_conv = h_o * P_outer;
+            double G_cond = 1.0 / std::max(1e-12, R_cond); // 导热热导
+            double T_wall_inner = (hA_conv * T_prev + G_cond * T_wall_soil) / std::max(1e-12, (hA_conv + G_cond));
+
+            // (3) 用已求得的 T_wall_inner 计算实际的壁面换热热流 q_wall
+            double q_wall = hA_conv * (T_prev - T_wall_inner); // W/m
+            // --- END OF MODIFICATION ---
+
+            // 约 111 行：原代码中的 q_wall 现在已经由新的方法计算得到
+            // double q_wall = (T_prev - T_wall) / std::max(1e-12, Rb); // DELETE THIS LINE
+
+            // 与内管耦合（用上一轮的内管温度）
             // 与内管耦合（用上一轮的内管温度）
             double T_inner_old = T_inner_.empty() ? T_prev : T_inner_[i];
             double q_inner = 0.0;
             {
-                double A_ann  = std::max(1e-12, 0.25 * PI * (D_inner_wall*D_inner_wall - D_inn*D_inn));
-                double A_in   = std::max(1e-12, 0.25 * PI * (D_i_inner*D_i_inner));
-                double v_in  = m_dot / (rho * A_in);
+                // ---- 1) 速度/雷诺数：仍沿用你原来的写法 ----
+                double A_ann = std::max(1e-12, 0.25 * PI * (D_inner_wall * D_inner_wall - D_inn * D_inn));
+                double A_in = std::max(1e-12, 0.25 * PI * (D_i_inner * D_i_inner));
+                double v_in = m_dot / (rho * A_in);
                 double v_ann = m_dot / (rho * A_ann);
-                double Re_in  = rho * v_in  * std::max(1e-6, D_i_inner)    / mu;
+                double Re_in = rho * v_in * std::max(1e-6, D_i_inner) / mu;
                 double Re_ann = rho * v_ann * std::max(1e-6, Dh_ann) / mu;
-                double Nu_in  = blendNu(Re_in, Pr);
-                double Nu_ann = blendNu(Re_ann,Pr);
-                double h_i = std::max(h_min, Nu_in  * kf / std::max(1e-6, D_i_inner));
-                double h_o_ann = std::max(h_min, Nu_ann * kf / std::max(1e-6, Dh_ann));
-                double U_per_len = (h_i * P_inner * h_o_ann * P_outer) / std::max(1e-9, h_i * P_inner + h_o_ann * P_outer);
-                q_inner = U_per_len * (T_prev - T_inner_old); // W/m
+
+                double Nu_in = blendNu(Re_in, Pr);
+                double Nu_ann = blendNu(Re_ann, Pr);
+
+                // 内管内对流换热系数（inner fluid -> inner pipe inner wall）
+                double h_in = std::max(h_min, Nu_in * kf / std::max(1e-6, D_i_inner));
+
+                // 环空侧对流换热系数（annulus fluid -> inner pipe outer wall）
+                // 注意：这里特征长度你原来用 Dh_ann，我保留
+                double h_ann = std::max(h_min, Nu_ann * kf / std::max(1e-6, Dh_ann));
+
+                // ---- 2) 单位长度周长：一定要用“对应的传热表面” ----
+                // 内管内表面周长
+                const double P_in = PI * std::max(1e-6, D_i_inner);
+                // 内管外表面周长（环空侧换热就是对着内管外壁）
+                const double P_ann = PI * std::max(1e-6, D_inn);
+
+                // ---- 3) 单位长度热阻网络 R' (K·m/W) ----
+                // (a) 内管内对流热阻
+                const double R_conv_in = 1.0 / std::max(1e-12, h_in * P_in);
+
+                // (b) 内管管壁导热热阻（从内管内半径 -> 内管外半径）
+                // 半径：r_i = D_i_inner/2, r_o = D_inn/2
+                double k_pipe_inner = (cfg_.pipe_k_inner > 0.0 ? cfg_.pipe_k_inner : cfg_.pipe.k);
+                const double r_i = 0.5 * std::max(1e-6, D_i_inner);
+                const double r_o = 0.5 * std::max(1e-6, D_inn);
+                const double R_cond_pipe = std::log(std::max(1e-12, r_o / r_i)) / (2.0 * PI * std::max(1e-12, k_pipe_inner));
+
+                double R_cond_ins = 0.0;
+                // 只在保温层启用 + 深度范围内才加
+                if (cfg_.insul.enable && zc_[i] <= std::max(0.0, cfg_.insul.top_len_m)) {
+                    const double t_ins = cfg_.insul.thickness_m;
+                    const double k_ins = cfg_.insul.k_inner;
+
+                    if (t_ins > 1e-9 && k_ins > 1e-9) {
+                        const double r_ins_i = r_o;
+                        const double r_ins_o = r_o + t_ins;
+                        R_cond_ins =
+                            std::log(std::max(1e-12, r_ins_o / r_ins_i)) /
+                            (2.0 * PI * k_ins);
+                    }
+                }
+
+
+                // (d) 环空侧对流热阻（annulus fluid -> inner pipe outer wall）
+                const double R_conv_ann = 1.0 / std::max(1e-12, h_ann * P_ann);
+
+                // 总热阻（单位长度）
+                const double R_tot = R_conv_in + R_cond_pipe + R_cond_ins + R_conv_ann;
+
+                // ---- 4) 单位长度换热 q' (W/m) ----
+                // 保持你原来的符号：T_prev 是环空温度，T_inner_old 是内管流体温度
+                q_inner = (T_prev - T_inner_old) / std::max(1e-12, R_tot);
             }
+
 
             double q_prime = q_wall + q_inner; // 总换热
             double dT = - (q_prime * dz_) / (m_dot * cp);
-            dT = clampd(dT, -15.0, 15.0);
+            dT = clampd(dT, -55.0, 55.0);
             T_outer_new[i] = T_prev + dT;
             q_line[i] = q_wall; // 壁面传给土壤的热流，供后续土壤更新
             T_prev = T_outer_new[i];
@@ -130,14 +216,60 @@ double GroundModule::step(double T_return_C, double& Q_extracted_kW, double dt_s
         double Re_ann = rho * v_ann * std::max(1e-6, Dh_ann) / mu;
         double Nu_in  = blendNu(Re_in, Pr);
         double Nu_ann = blendNu(Re_ann,Pr);
-        double h_i = std::max(h_min, Nu_in  * kf / std::max(1e-6, D_i_inner));
-        double h_o = std::max(h_min, Nu_ann * kf / std::max(1e-6, Dh_ann));
+        double h_i = h_boost * std::max(h_min, Nu_in  * kf / std::max(1e-6, D_i_inner));
+        double h_o = h_boost * std::max(h_min, Nu_ann * kf / std::max(1e-6, Dh_ann));
 
         T_prev = T_outer_new.back();
         for (int i = N_ - 1; i >= 0; --i) {
-            double U_per_len = (h_i * P_inner * h_o * P_outer) / std::max(1e-9, h_i * P_inner + h_o * P_outer);
-            double q_prime = U_per_len * (T_prev - T_outer_new[i]); // W/m
-            double dT = - (q_prime * dz_) / (m_dot * cp);
+            // 用与下行段一致的热阻网络来算内外管换热（单位长度）
+            double A_ann2 = std::max(1e-12, 0.25 * PI * (D_inner_wall * D_inner_wall - D_inn * D_inn));
+            double A_in2 = std::max(1e-12, 0.25 * PI * (D_i_inner * D_i_inner));
+            double v_in2 = m_dot / (rho * A_in2);
+            double v_ann2 = m_dot / (rho * A_ann2);
+            double Re_in2 = rho * v_in2 * std::max(1e-6, D_i_inner) / mu;
+            double Re_ann2 = rho * v_ann2 * std::max(1e-6, Dh_ann) / mu;
+
+            double Nu_in2 = blendNu(Re_in2, Pr);
+            double Nu_ann2 = blendNu(Re_ann2, Pr);
+
+            double h_in2 = h_boost * std::max(h_min, Nu_in2 * kf / std::max(1e-6, D_i_inner));
+            double h_ann2 = h_boost * std::max(h_min, Nu_ann2 * kf / std::max(1e-6, Dh_ann));
+
+            const double P_in2 = PI * std::max(1e-6, D_i_inner);
+            const double P_ann2 = PI * std::max(1e-6, D_inn);
+
+            const double R_conv_in2 = 1.0 / std::max(1e-12, h_in2 * P_in2);
+            const double R_conv_ann2 = 1.0 / std::max(1e-12, h_ann2 * P_ann2);
+
+            double k_pipe_inner2 = (cfg_.pipe_k_inner > 0.0 ? cfg_.pipe_k_inner : cfg_.pipe.k);
+            const double r_i2 = 0.5 * std::max(1e-6, D_i_inner);
+            const double r_o2 = 0.5 * std::max(1e-6, D_inn);
+            const double R_cond_pipe2 =
+                std::log(std::max(1e-12, r_o2 / r_i2)) / (2.0 * PI * std::max(1e-12, k_pipe_inner2));
+
+            // 绝热层（与下行段保持一致：先用 1A 的写法）
+            double R_cond_ins2 = 0.0;
+
+            if (cfg_.insul.enable && zc_[i] <= std::max(0.0, cfg_.insul.top_len_m)) {
+                const double t_ins2 = cfg_.insul.thickness_m;
+                const double k_ins2 = cfg_.insul.k_inner;
+
+                if (t_ins2 > 1e-9 && k_ins2 > 1e-9) {
+                    const double r_ins_i2 = r_o2;
+                    const double r_ins_o2 = r_o2 + t_ins2;
+                    R_cond_ins2 =
+                        std::log(std::max(1e-12, r_ins_o2 / r_ins_i2)) /
+                        (2.0 * PI * k_ins2);
+                }
+            }
+
+
+            const double R_tot2 = R_conv_in2 + R_cond_pipe2 + R_cond_ins2 + R_conv_ann2;
+
+            // 上行段：T_prev 是内管流体温度，T_outer_new[i] 是环空温度
+            double q_prime = (T_prev - T_outer_new[i]) / std::max(1e-12, R_tot2); // W/m
+            double dT = -(q_prime * dz_) / (m_dot * cp);
+
             dT = clampd(dT, -15.0, 15.0);
             T_inner_new[i] = T_prev + dT;
             T_prev = T_inner_new[i];
@@ -155,22 +287,7 @@ double GroundModule::step(double T_return_C, double& Q_extracted_kW, double dt_s
         if (maxDiff < tolT) break;
     }
 
-    // 迭代结束后，基于最终温度再计算一遍壁面热流（含 Rb）
-    {
-        double Re_outer = cfg_.calcRe(m_dot, Dh_outer);
-        for (int i = 0; i < N_; ++i) {
-            double Nu = cfg_.NuFunc ? cfg_.NuFunc(Re_outer, Pr, zc_[i]) : blendNu(Re_outer, Pr);
-            double h_o  = std::max(h_min, Nu * kf / std::max(1e-6, Dh_outer));
-            double Rf = 1.0 / std::max(1e-9, h_o * P_outer);
-            double k_outer = (cfg_.pipe_k_outer > 0.0 ? cfg_.pipe_k_outer : cfg_.pipe.k);
-            double Rp = std::log(r_po / r_pi) / (2.0 * PI * std::max(1e-9, k_outer));
-            double Rg = std::log(r_bo / r_po) / (2.0 * PI * std::max(1e-9, cfg_.grout.k));
-            double Rb = Rf + Rp + Rg;
-            double T_wall = Tsoil_[0].empty() ? T_soil_local[i] : Tsoil_[0][i];
-            q_line_wall_[i] = (T_outer_[i] - T_wall) / std::max(1e-12, Rb);
-        }
-    }
-
+ 
     if (advanceSoil) soil_step_ADI_(dt_s);
 
     double Qtot_W = 0.0;
@@ -257,12 +374,39 @@ void GroundModule::update_inner_upstream_(double T_bottom_in_C, const std::vecto
         const double h_o = std::max(h_min, Nu_ann * kf / std::max(1e-6, Dh_ann));
 
         const double R_i = 1.0 / std::max(1e-9, h_i * 2.0 * PI * std::max(1e-9, r_i_inner));
-        const double z = zc_[i];
-        double kin = (cfg_.pipe_k_inner > 0.0 ? cfg_.pipe_k_inner : cfg_.pipe.k);
-        if (cfg_.insul.enable && z <= std::max(0.0, cfg_.insul.top_len_m)) kin = std::max(1e-4, cfg_.insul.k_inner);
-        const double R_w = std::log(std::max(1e-6, r_i_outer) / std::max(1e-6, r_i_inner)) / (2.0 * PI * std::max(1e-9, kin));
-        const double R_o = 1.0 / std::max(1e-9, h_o * 2.0 * PI * std::max(1e-9, r_i_outer));
-        const double U_per_len = 1.0 / std::max(1e-12, R_i + R_w + R_o);
+
+        // 管壁导热永远用管材
+        double k_pipe = (cfg_.pipe_k_inner > 0.0 ? cfg_.pipe_k_inner : cfg_.pipe.k);
+        const double R_w =
+            std::log(std::max(1e-12, r_i_outer / r_i_inner)) /
+            (2.0 * PI * std::max(1e-12, k_pipe));
+
+        // 保温层作为额外热阻（深度范围内启用）
+        double R_ins = 0.0;
+        double r_conv_outer = r_i_outer; // 默认对流发生在内管外表面
+
+        if (cfg_.insul.enable && zc_[i] <= std::max(0.0, cfg_.insul.top_len_m)) {
+            const double t_ins = cfg_.insul.thickness_m;
+            const double k_ins = cfg_.insul.k_inner;
+
+            if (t_ins > 1e-9 && k_ins > 1e-9) {
+                const double r_ins_i = r_i_outer;
+                const double r_ins_o = r_i_outer + t_ins;
+
+                R_ins =
+                    std::log(std::max(1e-12, r_ins_o / r_ins_i)) /
+                    (2.0 * PI * k_ins);
+
+                r_conv_outer = r_ins_o; // 对流边界在保温层外表面
+            }
+        }
+
+        // 环空侧对流（用保温层外半径）
+        const double R_o =
+            1.0 / std::max(1e-12, h_o * 2.0 * PI * std::max(1e-12, r_conv_outer));
+
+        const double U_per_len =
+            1.0 / std::max(1e-12, R_i + R_w + R_ins + R_o);
 
         const double q_prime_Wpm = U_per_len * (T_prev - T_outer); // W/m
         const double dT_raw = - (q_prime_Wpm * dz_) / (m_dot * cp);
@@ -282,7 +426,12 @@ double GroundModule::integrate_Q_extracted_kW_(const std::vector<double>& q_wall
 void GroundModule::build_soil_grid_() {
     r_.clear(); dr_.clear();
     const double rMax = cfg_.rMax_m; double r_acc = r_bore_; double dr = cfg_.dr0_m;
-    while (r_acc < rMax) { double r_cell_center = r_acc + 0.5 * dr; r_.push_back(r_cell_center); dr_.push_back(dr); r_acc += dr; dr *= cfg_.dr_growth; }
+    while (r_acc < rMax) {
+        double r_cell_center = r_acc + 0.5 * dr; 
+        r_.push_back(r_cell_center); 
+        dr_.push_back(dr); 
+        r_acc += dr; 
+        dr *= cfg_.dr_growth; }
     Nr_ = static_cast<int>(r_.size());
     if (Nr_ < 3) { while (Nr_ < 3) { double back = dr_.empty() ? cfg_.dr0_m : dr_.back(); r_.push_back((r_acc + 0.5 * back)); dr_.push_back(back); r_acc += back; ++Nr_; } }
 }

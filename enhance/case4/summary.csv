@@ -1,0 +1,2 @@
+elec_kWh,comp_kWh,pump_kWh,heat_kWh,space_kWh,dhw_kWh,cost_elec,capex,lifetime_y,discount,CRF,LCOH_annual,SCOP_sys,peak_Pel_kW,peak_Ppump_kW,peak_Qout_kW,on_hours,starts,stops,om_annual
+569234,496195,73038.3,2.45164e+06,2.44285e+06,8794.5,0,2.22528e+06,20,0.08,0.101852,0.20305,4.30691,102.56,14.6176,1313.85,4982,1257,1257,22252.8

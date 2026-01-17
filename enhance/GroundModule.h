@@ -34,7 +34,7 @@ private:
     int Nr_ = 0;
     double dz_ = 0.0;
     double r_bore_ = 0.0;
-
+    double m_dot_kgps_ = 0.0;
     std::vector<double> zc_;
     std::vector<double> z_;
     std::vector<double> r_;

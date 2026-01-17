@@ -66,6 +66,18 @@ int main() {
     if (const char* v = std::getenv("LOAD_BASE_KW"))    try { CFG.load.base_kW    = std::stod(v);} catch(...) {}
     if (const char* v = std::getenv("LOAD_INDOOR_T"))   try { CFG.load.indoor_T_C = std::stod(v);} catch(...) {}
 
+    // Solar thermal overrides
+    if (const char* v = std::getenv("SOLAR_ENABLE")) { CFG.solar.enable = (*v!='0' && *v!='n' && *v!='N'); }
+    if (const char* v = std::getenv("SOLAR_WEATHER_CSV")) { CFG.solar.weather_csv = v; }
+    if (const char* v = std::getenv("SOLAR_IRR_COL")) { CFG.solar.irr_column = v; }
+    if (const char* v = std::getenv("SOLAR_IRR_MIN_WM2")) try { CFG.solar.irr_on_Wm2 = std::stod(v);} catch(...) {}
+    if (const char* v = std::getenv("SOLAR_AREA_M2")) try { CFG.solar.area_m2 = std::stod(v);} catch(...) {}
+    if (const char* v = std::getenv("SOLAR_ETA")) try { CFG.solar.eta = std::stod(v);} catch(...) {}
+    if (const char* v = std::getenv("SOLAR_MDOT_NOM_KGPS")) try { CFG.solar.mdot_nominal_kgps = std::stod(v);} catch(...) {}
+    if (const char* v = std::getenv("SOLAR_MDOT_MAX_KGPS")) try { CFG.solar.mdot_max_kgps = std::stod(v);} catch(...) {}
+    if (const char* v = std::getenv("SOLAR_T_OUT_MAX_C")) try { CFG.solar.T_out_max_C = std::stod(v);} catch(...) {}
+    if (const char* v = std::getenv("SOLAR_DT_MAX_C")) try { CFG.solar.dT_max_C = std::stod(v);} catch(...) {}
+
     // Tank configuration overrides
     if (const char* v = std::getenv("TANK_VOL_M3"))     try { CFG.tank.volume_m3   = std::stod(v);} catch(...) {}
     if (const char* v = std::getenv("TANK_SET_C"))      try { CFG.tank.setpoint_C  = std::stod(v);} catch(...) {}
@@ -93,7 +105,7 @@ int main() {
 
     // Pipe material: set PE-like conductivity by default (reduce short-circuiting)
     // Thickness stays unchanged; override via PIPE_K if needed.
-    CFG.pipe.k = 0.4; // W/m-K (typical PE/PEX ~0.35鈥?.45)
+
     if (const char* v = std::getenv("PIPE_K"))             try { CFG.pipe.k = std::stod(v);} catch(...) {}
 
     // Geometry and ground overrides (optional)
@@ -153,15 +165,11 @@ int main() {
     if (const char* v = std::getenv("ECON_TANK_COST"))       try { CFG.econ.tank_cost_fixed   = std::stod(v);} catch(...) {}
     if (const char* v = std::getenv("ECON_PUMP_COST"))       try { CFG.econ.pump_cost_fixed   = std::stod(v);} catch(...) {}
     if (const char* v = std::getenv("ECON_MISC_FIXED"))      try { CFG.econ.misc_fixed        = std::stod(v);} catch(...) {}
-
+    //Creaet timecontrol
+  
     // Simulation horizon: default to 1 year at 1-hour timestep unless overridden
     {
-        int years = 1;
-        if (const char* v = std::getenv("SIM_YEARS")) { try { years = std::max(1, std::stoi(v)); } catch(...) {} }
-        int dt_s = 600; // default 10 minutes per step
-        if (const char* v = std::getenv("TIME_STEP_S")) { try { dt_s = std::max(60, std::stoi(v)); } catch(...) {} }
-        CFG.time.timeStep_s = static_cast<double>(dt_s);
-        // steps per hour = 3600/dt_s
+        double years = CFG.time.year;
         int steps_per_year = static_cast<int>( (3600.0 / CFG.time.timeStep_s) * 8760.0 + 0.5 );
         CFG.time.totalSteps = years * steps_per_year;
     }

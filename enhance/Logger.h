@@ -35,7 +35,15 @@ public:
         double flow_src_kgps,
         double flow_load_kgps,
         double dP_kPa,
-        double P_pump_kW);
+        double P_pump_kW,
+        int    solar_on,
+        int    solar_mode,
+        double solar_irr_Wm2,
+        double solar_mdot_kgps,
+        double solar_T_in_C,
+        double solar_T_out_C,
+        double solar_Q_kW,
+        double solar_Q_raw_kW);
     void writeDebugHour(int hour,
         const std::string& fluid,
         bool used_coolprop,
