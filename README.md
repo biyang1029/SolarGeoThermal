@@ -11,6 +11,7 @@ Enhance is a numerical simulation program for a coaxial (annulus + inner) ground
 - Variable time step: first 2000 steps = 10 min; then +6 s per step up to 1 h; then fixed 2 h
 - Weather‑driven load: based on outdoor temperature and indoor setpoint; load is 0 when `Tout > 26°C` (can be disabled)
 - Heat pump + tank: outlet setpoint with deadband ON/OFF; COP hard upper cap removed (keep lower bound and freeze guard)
+- Solar thermal concentrator: reads irradiance from weather CSV, heats tank in heating season, recharges ground loop in off-season
 - Physical coupling:
   - Inner/annulus convection via Re/Pr/Nu correlations (Dittus–Boelter with transition blending)
   - Series thermal resistances of inner/outer pipe walls, grout, soil
@@ -122,10 +123,21 @@ What it does:
   - `step,date,time,T_source_out_C,T_return_C,COP,Q_out_kW,P_el_kW,Q_geo_kW,model,
      T_tank_C,HP_on,Q_space_req_kW,Q_dhw_req_kW,Q_space_served_kW,Q_dhw_served_kW,Q_unmet_kW,
      flow_src_kgps,flow_load_kgps,dP_kPa,P_pump_kW`
+- `results_solar.csv` (hourly rows): solar/ground/load temperatures, flow rates, HP on/off, COP, and power terms (for plotting)
 - `debug.csv`: cycle state and CoolProp diagnostics
 - `summary.csv`: end‑of‑run energy/heat/peaks/economics
 - `runs_*/results_*.csv` / `debug_*.csv`: archived sweep results
 - `runs_*/summary_runs.csv`: sweep summary (including measured comparisons)
+
+---
+
+## Plotting (3-case comparison)
+The script `enhance/plot_results_solar.py` draws five comparison figures from three cases.
+Edit `CASE_FILES` at the top or pass three files on the command line:
+```
+python plot_results_solar.py path\to\case1.csv path\to\case2.csv path\to\case3.csv
+```
+Figures are saved to `enhance/plots_solar/`.
 
 ---
 

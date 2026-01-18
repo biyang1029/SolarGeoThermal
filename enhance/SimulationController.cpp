@@ -256,7 +256,7 @@ if (!flow_cfg_inited) {
             double qmax = std::max(1e-6, cfg_.hp.max_Q_out_kW);
             frac = clampd(cmd / qmax, 0.0, 1.0);
         }
-        // 固定流量运行：供暖季按热泵；非供暖季太阳能运行时用于地热回灌循环
+        // Fixed flow: in heating season use HP loop; in off-season use solar-driven ground recharge loop
         double flow_src_now = 0.0;
         double flow_load_now = 0.0;
         if (heating_on && any_demand && hp_on_) {
